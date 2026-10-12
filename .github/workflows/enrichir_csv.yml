@@ -1,4 +1,4 @@
-name: Enrichir un CSV SIREN (CA public + EORI)
+name: Enrichir un CSV SIREN (CA public + EORI + LEI)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,11 @@ on:
         type: string
         required: true
         default: "inputs/enrichir.csv"
+      max_leads:
+        description: "Nombre de lignes à enrichir en partant de la fin (0 = toutes)"
+        type: number
+        required: true
+        default: 0
 
 permissions:
   contents: read
@@ -53,12 +58,13 @@ jobs:
       - name: Enrichir le fichier
         env:
           CSV_PATH: ${{ inputs.csv_path }}
-        run: python enrichir_csv.py --input "$CSV_PATH" --output outputs/enrichi.csv
+          MAX_LEADS: ${{ inputs.max_leads }}
+        run: python enrichir_csv.py --input "$CSV_PATH" --output outputs/enrichi.csv --limit "$MAX_LEADS"
 
       - name: Publier le CSV enrichi comme artefact
         uses: actions/upload-artifact@v4
         with:
-          name: csv-enrichi-ca-eori
+          name: csv-enrichi-ca-eori-lei
           path: outputs/enrichi.csv
           if-no-files-found: error
           retention-days: 7
