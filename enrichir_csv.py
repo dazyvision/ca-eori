@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enrich a CSV of French SIRENs with public turnover and EU EORI checks.
+"""Enrich a CSV of French SIRENs with public turnover, EORI and LEI checks.
 
 Turnover is taken from the open API Recherche d'entreprises (DINUM), listed
 on data.gouv.fr. It is only returned when public financial information is
@@ -29,9 +29,11 @@ import requests
 
 RECHERCHE_API = "https://recherche-entreprises.api.gouv.fr/search"
 EORI_WS = "https://ec.europa.eu/taxation_customs/dds2/eos/validation/services/validation"
+GLEIF_API = "https://api.gleif.org/api/v1/lei-records"
 CA_SOURCE = "https://annuaire-entreprises.data.gouv.fr/donnees/api-entreprises"
 EORI_SOURCE = "https://taxation-customs.ec.europa.eu/customs/customs-procedures/import-and-export/customs-operations/economic-operators-registration-and-identification-number-eori_en"
-PAUSE_SECONDS = 0.4
+LEI_SOURCE = "https://www.gleif.org/en/lei-data/gleif-api/"
+PAUSE_SECONDS = 1.0
 
 SOAP_ENVELOPE = """<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
@@ -47,6 +49,7 @@ SOAP_ENVELOPE = """<?xml version="1.0" encoding="UTF-8"?>
 OUTPUT_FIELDS = (
     "ca_eur", "ca_exercice", "ca_statut", "ca_source", "ca_verifie_le",
     "eori", "eori_statut", "eori_source", "eori_verifie_le",
+    "lei_code", "lei_statut", "lei_lookup_status", "lei_source", "lei_verifie_le", "lei_erreur",
 )
 
 
@@ -149,6 +152,49 @@ def fetch_eori(session: requests.Session, siren: str) -> tuple[str, str]:
     return number, "ERREUR_REPONSE_INCONNUE"
 
 
+def fetch_lei(session: requests.Session, siren: str) -> tuple[str, str, str]:
+    """Return exact SIREN match as (LEI, registration status, lookup status).
+
+    Keep successful no-match, ambiguous results and service errors distinct.
+    """
+    try:
+        response = session.get(
+            GLEIF_API,
+            params={
+                "filter[entity.registeredAs]": siren,
+                "filter[entity.legalAddress.country]": "FR",
+                "page[size]": 20,
+            },
+            headers={"Accept": "application/vnd.api+json", "User-Agent": "rev-os-csv-enrichment/1.0"},
+            timeout=25,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        records = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(records, list):
+            return "", "", "ERREUR_API"
+    except (requests.RequestException, ValueError, json.JSONDecodeError):
+        return "", "", "ERREUR_API"
+
+    matches = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        attributes = record.get("attributes") or {}
+        entity = attributes.get("entity") or {}
+        registered = re.sub(r"\s+", "", str(entity.get("registeredAs") or ""))
+        if registered == siren:
+            registration = attributes.get("registration") or {}
+            matches.append((str(attributes.get("lei") or record.get("id") or ""),
+                            str(registration.get("status") or "INCONNU").upper()))
+    if not matches:
+        return "", "", "AUCUN_RESULTAT"
+    if len(matches) != 1:
+        return "", "", "AMBIGU"
+    lei, status = matches[0]
+    return lei, status, "TROUVE"
+
+
 def read_csv(path: Path) -> tuple[list[dict[str, str]], list[str], str]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         sample = handle.read(8192)
@@ -167,33 +213,44 @@ def read_csv(path: Path) -> tuple[list[dict[str, str]], list[str], str]:
         return list(reader), list(reader.fieldnames), delimiter
 
 
-def enrich(input_path: Path, output_path: Path, pause: float = PAUSE_SECONDS) -> dict[str, int]:
+def enrich(input_path: Path, output_path: Path, pause: float = PAUSE_SECONDS, limit: int = 0) -> dict[str, int]:
     if input_path.resolve() == output_path.resolve():
         raise ValueError("Le CSV de sortie doit être différent du fichier source")
     rows, fields, delimiter = read_csv(input_path)
+    if limit < 0:
+        raise ValueError("La limite doit être positive ou nulle")
+    # A positive cap intentionally keeps the last N data rows from the input.
+    if limit:
+        rows = rows[-limit:]
     siren_column = next(name for name in fields if name and name.strip().lower() in {"siren", "siren_number", "siren number"})
     out_fields = fields + [name for name in OUTPUT_FIELDS if name not in fields]
     checked_at = dt.date.today().isoformat()
     ca_session = requests.Session()
     eori_session = requests.Session()
+    lei_session = requests.Session()
     turnover_cache: dict[str, tuple[str, str, str]] = {}
     eori_cache: dict[str, tuple[str, str]] = {}
-    totals = {"rows": len(rows), "ca_publie": 0, "eori_valide": 0, "erreurs": 0, "siren_invalide": 0}
+    lei_cache: dict[str, tuple[str, str, str]] = {}
+    totals = {"rows": len(rows), "ca_publie": 0, "eori_valide": 0, "lei_trouve": 0, "erreurs": 0, "siren_invalide": 0}
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         for row in rows:
             siren = normalize_siren(row.get(siren_column))
             if not siren:
                 row.update({"ca_eur": "", "ca_exercice": "", "ca_statut": "SIREN_INVALIDE", "ca_source": CA_SOURCE, "ca_verifie_le": checked_at,
-                            "eori": "", "eori_statut": "SIREN_INVALIDE", "eori_source": EORI_SOURCE, "eori_verifie_le": checked_at})
+                            "eori": "", "eori_statut": "SIREN_INVALIDE", "eori_source": EORI_SOURCE, "eori_verifie_le": checked_at,
+                            "lei_code": "", "lei_statut": "", "lei_lookup_status": "SIREN_INVALIDE",
+                            "lei_source": LEI_SOURCE, "lei_verifie_le": checked_at, "lei_erreur": ""})
                 totals["siren_invalide"] += 1
                 continue
 
             if siren not in turnover_cache:
                 ca_future = pool.submit(fetch_turnover, ca_session, siren)
                 eori_future = pool.submit(fetch_eori, eori_session, siren)
+                lei_future = pool.submit(fetch_lei, lei_session, siren)
                 turnover_cache[siren] = ca_future.result()
                 eori_cache[siren] = eori_future.result()
+                lei_cache[siren] = lei_future.result()
                 # One request per service per interval. Parallel calls keep
                 # the per-service rate at or below 1 / pause seconds.
                 time.sleep(pause)
@@ -212,6 +269,15 @@ def enrich(input_path: Path, output_path: Path, pause: float = PAUSE_SECONDS) ->
             elif eori_status.startswith("ERREUR"):
                 totals["erreurs"] += 1
 
+            lei_code, lei_status, lei_lookup = lei_cache[siren]
+            row.update({"lei_code": lei_code, "lei_statut": lei_status, "lei_lookup_status": lei_lookup,
+                        "lei_source": LEI_SOURCE, "lei_verifie_le": checked_at,
+                        "lei_erreur": "Erreur de consultation GLEIF" if lei_lookup == "ERREUR_API" else ""})
+            if lei_lookup == "TROUVE":
+                totals["lei_trouve"] += 1
+            elif lei_lookup == "ERREUR_API":
+                totals["erreurs"] += 1
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=out_fields, delimiter=delimiter, extrasaction="ignore")
@@ -225,11 +291,15 @@ def main() -> int:
     parser.add_argument("--input", required=True, type=Path, help="CSV existant contenant une colonne siren")
     parser.add_argument("--output", required=True, type=Path, help="nouveau CSV enrichi")
     parser.add_argument("--pause", type=float, default=PAUSE_SECONDS, help="pause entre les appels (secondes)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="nombre de lignes à traiter depuis la fin du CSV (0 = toutes)")
     args = parser.parse_args()
     if args.pause < 0:
         parser.error("--pause doit être positif ou nul")
+    if args.limit < 0:
+        parser.error("--limit doit être positif ou nul")
     try:
-        totals = enrich(args.input, args.output, args.pause)
+        totals = enrich(args.input, args.output, args.pause, args.limit)
     except (OSError, ValueError) as exc:
         print(f"Erreur: {exc}", file=sys.stderr)
         return 2
