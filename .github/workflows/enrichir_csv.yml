@@ -1,0 +1,64 @@
+name: Enrichir un CSV SIREN (CA public + EORI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Chemin du CSV déjà présent dans le dépôt, sous inputs/"
+        type: string
+        required: true
+        default: "inputs/enrichir.csv"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enrichir-csv-siren
+  cancel-in-progress: false
+
+jobs:
+  enrichir:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Récupérer main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer la dépendance HTTP
+        run: python -m pip install requests
+
+      - name: Valider le chemin du CSV
+        env:
+          CSV_PATH: ${{ inputs.csv_path }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["CSV_PATH"])
+          if path.is_absolute() or ".." in path.parts or not path.as_posix().startswith("inputs/") or path.suffix.lower() != ".csv":
+              raise SystemExit("Le fichier doit être un CSV relatif situé sous inputs/")
+          if not path.is_file():
+              raise SystemExit(f"CSV introuvable : {path}")
+          PY
+
+      - name: Enrichir le fichier
+        env:
+          CSV_PATH: ${{ inputs.csv_path }}
+        run: python enrichir_csv.py --input "$CSV_PATH" --output outputs/enrichi.csv
+
+      - name: Publier le CSV enrichi comme artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-enrichi-ca-eori
+          path: outputs/enrichi.csv
+          if-no-files-found: error
+          retention-days: 7
