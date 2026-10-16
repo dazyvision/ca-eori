@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -158,7 +159,7 @@ def bodacc_events(since, today, allowed):
 def rss_events(since, warnings):
     for url in RSS:
         try:
-            root = ET.fromstring(get(url))
+            root = parse_rss(get(url), url)
             for item in root.findall('.//item'):
                 title = html.unescape(item.findtext('title', ''))
                 description = re.sub('<[^>]+>', ' ', html.unescape(item.findtext('description', '')))
@@ -212,72 +213,221 @@ def qualify(event, ent, today, max_age, ca_max, allowed):
             'statut': 'A_QUALIFIER' if event['source'] == 'BODACC' else 'PRESSE_IDENTITE_VERIFIEE_LEVEE_A_CONFIRMER'}
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--input', help='CSV de SIREN à surveiller ; absent = découverte France')
-    parser.add_argument('--days', type=int, default=7)
-    parser.add_argument('--max-age', type=int, default=5)
-    parser.add_argument('--ca-max', type=float, default=15_000_000, help='CA publié maximum ; inconnu conservé')
-    parser.add_argument('--no-rss', action='store_true')
-    parser.add_argument('--output-dir', default='sorties/veille_gratuite')
-    args = parser.parse_args(argv)
-    if args.days < 1 or args.max_age < 1 or args.ca_max <= 0:
-        parser.error('days, max-age et ca-max doivent être positifs')
-    today = dt.datetime.now(ZoneInfo('Europe/Paris')).date()
-    since = today - dt.timedelta(days=args.days - 1)
-    allowed = read_sirens(args.input)
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    cache = load_json(out / 'entreprises_cache.json')
-    seen = load_json(out / 'evenements_vus.json')
-    warnings, rows = [], []
-    fatal = False
-    events = []
+
+def parse_rss(raw, url):
     try:
-        events.extend(bodacc_events(since.isoformat(), today.isoformat(), allowed))
-    except Exception as exc:
-        fatal = True
-        warnings.append(f'BODACC incomplet : {type(exc).__name__}: {exc}')
-    if not args.no_rss:
-        events.extend(rss_events(since, warnings))
-    unique = {e['event_id']: e for e in events}
-    for event in unique.values():
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        parser = expat.ParserCreate()
         try:
-            query = event.get('siren') or event.get('company')
-            ent = resolve(query, cache, today) if query else None
-            row = qualify(event, ent, today, args.max_age, args.ca_max, allowed)
-        except Exception as exc:
-            warnings.append(f"Résolution {event.get('siren') or event['company']} : {type(exc).__name__}: {exc}")
-            row = {**event, 'statut': 'ERREUR_RESOLUTION_A_RETENTER'}
-        if row:
-            row['nouveau'] = 'NON' if row['event_id'] in seen else 'OUI'
-            rows.append(row)
-    stamp = today.isoformat()
-    csv_path = out / f'veille_{stamp}.csv'
-    with csv_path.open('w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction='ignore')
+            parser.Parse(raw, True)
+        except expat.ExpatError as exc:
+            if exc.code != expat.errors.codes[expat.errors.XML_ERROR_JUNK_AFTER_DOC_ELEMENT]:
+                raise
+            root = ET.fromstring(raw[:parser.ErrorByteIndex])
+            print(f"INFO : suffixe parasite ignoré pour {url}")
+        else:
+            raise ValueError("XML non interprétable")
+    if root.tag != "rss" or root.find("channel") is None:
+        raise ValueError("Réponse non RSS")
+    return root
+
+
+# Heuristiques de présélection, jamais preuve d'innovation ou d'indépendance.
+TECH_CODES = ("58.2", "62.01", "63.11", "72.", "21.", "26.", "27.", "28.", "32.5")
+SECONDARY_CODES = ("64", "65", "66", "68", "70.10")
+NEW_FIELDS = FIELDS + ["lot", "motif", "profil", "ca_statut", "premiere_detection",
+    "derniere_detection", "nb_augmentations", "gouvernance_mentionnee", "nature_operation",
+    "capital_avant", "capital_apres", "variation_nominale", "variation_pct",
+    "montant_statut", "statut_presse", "presse_urls", "date_premiere_presse",
+    "delai_presse_jours", "sources_bodacc", "verification_activite"]
+
+
+def operation_nature(text):
+    t = normalize(text)
+    kinds = []
+    for token, label in (("numeraire", "NUMERAIRE"), ("primedemission", "PRIME_EMISSION_MENTIONNEE"),
+                         ("incorporationdereserves", "INCORPORATION_RESERVES"),
+                         ("apportennature", "APPORT_NATURE"), ("conversion", "CONVERSION_A_VERIFIER"),
+                         ("fusion", "FUSION_A_VERIFIER")):
+        if token in t:
+            kinds.append(label)
+    return ";".join(kinds) or "NON_PRECISEE"
+
+
+def explicit_amounts(text):
+    # Only an explicit before/after statement in the SAME source is measured.
+    # Neither current capital alone nor two unrelated historical snapshots suffice.
+    number = r"([0-9][0-9 \u00a0\u202f]*(?:[,.][0-9]{1,2})?)"
+    m = re.search(r"capital.{0,80}?(?:de|du)\s+" + number +
+                  r"\s*(?:€|euros?|EUR)\s+(?:à|a|au)\s+" + number +
+                  r"\s*(?:€|euros?|EUR)", text, re.I)
+    if not m:
+        return {}
+    def amount(v):
+        return float(re.sub(r"[ \u00a0\u202f]", "", v).replace(",", "."))
+    before, after = map(amount, m.groups())
+    return {"capital_avant": before, "capital_apres": after,
+            "variation_nominale": after-before,
+            "variation_pct": round(100*(after-before)/before, 2) if before else "",
+            "montant_statut": "VARIATION_NOMINALE_EXPLICITE_PAS_MONTANT_LEVE"}
+
+
+def write_rows(path, rows):
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=NEW_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-    lines = [f'# Veille capital - {stamp}', '', f'Fenêtre : {since} au {today} | moins de {args.max_age} ans | zéro appel Pappers', '',
-             'Une modification ne prouve ni augmentation ni levée. Une annonce BODACC peut précéder ou suivre la presse.', '',
-             f'{len(rows)} événements retenus, dont {sum(r["nouveau"] == "OUI" for r in rows)} nouveaux.', '']
-    for row in rows:
-        lines.extend([f"- {row.get('company') or 'Identité à vérifier'} | {row.get('siren', '')} | {row['signal']} | {row['statut']} | nouveau={row['nouveau']}",
-                      f"  {row['source_url']}", f"  {row['preuve'][:600]}"])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Détection BODACC prioritaire, profils jeunes, presse en confirmation. Sans Pappers.")
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--max-age", type=int, default=8)
+    parser.add_argument("--ca-max", type=float, default=15000000)
+    parser.add_argument("--input", help="CSV facultatif de SIREN à surveiller")
+    parser.add_argument("--no-rss", action="store_true")
+    parser.add_argument("--output-dir", default="sorties/veille_gratuite")
+    parser.add_argument("--replay", help="Reclasser un ancien CSV sans appels BODACC ni résolution")
+    parser.add_argument("--nominal-min", type=float, default=50000,
+                        help="Seuil de variation nominale pour priorité, PAS seuil de fonds levés")
+    args = parser.parse_args(argv)
+    if not 1 <= args.days <= 90 or not 1 <= args.max_age <= 100 or args.ca_max <= 0 or args.nominal_min < 0:
+        parser.error("Paramètres hors limites")
+    today = dt.datetime.now(ZoneInfo("Europe/Paris")).date()
+    stamp = today.isoformat()
+    since = today - dt.timedelta(days=args.days-1)
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    state = load_json(out / "startup_state.json")
+    cache = load_json(out / "entreprises_cache.json")
+    allowed = read_sirens(args.input)
+    warnings, collected, press = [], [], []
+    fatal = False
+    if args.replay:
+        with open(args.replay, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                (press if row.get("source") == "RSS" else collected).append(row)
+        print("REPLAY : ancien périmètre du CSV conservé ; pas de rattrapage des 5-8 ans")
+    else:
+        try:
+            for event in bodacc_events(since.isoformat(), stamp, allowed):
+                try:
+                    ent = resolve(event["siren"], cache, today)
+                    row = qualify(event, ent, today, args.max_age, args.ca_max, allowed)
+                except Exception as exc:
+                    row = {**event, "statut": "ERREUR_RESOLUTION_A_RETENTER"}
+                    warnings.append(f"Résolution {event['siren']} : {type(exc).__name__}")
+                if row:
+                    collected.append(row)
+        except Exception as exc:
+            fatal = True
+            warnings.append(f"BODACC incomplet : {type(exc).__name__}: {exc}")
+        if not args.no_rss:
+            press.extend(rss_events(since, warnings))
+    # RSS never creates a prospect. Match only exact legal identity to an existing candidate.
+    # Reuse prior candidates so a later press publication can confirm them.
+    for row in collected:
+        key = row.get("siren")
+        if not key:
+            continue
+        candidate = state.setdefault(key, {"first_seen": stamp, "events": {}, "press": {}})
+        candidate["last_seen"] = stamp
+        candidate["events"][row["event_id"]] = row
+    for article in press:
+        key = article.get("siren") or ""
+        if not key and not args.replay and article.get("company"):
+            try:
+                ent = resolve(article["company"], cache, today)
+                key = str(ent["siren"]) if ent else ""
+            except Exception as exc:
+                warnings.append(f"Presse identité {article['company']} : {type(exc).__name__}")
+        if key in state and (allowed is None or key in allowed):
+            state[key]["press"][article["event_id"]] = article
+    rows = []
+    cutoff = today.replace(year=today.year-args.max_age, day=28) if today.month == 2 and today.day == 29 else today.replace(year=today.year-args.max_age)
+    for siren, candidate in state.items():
+        if allowed is not None and siren not in allowed:
+            continue
+        events = list(candidate["events"].values())
+        increases = [e for e in events if e.get("signal") == "AUGMENTATION_MENTIONNEE"]
+        base = max(increases or events, key=lambda e: e.get("date_publication", ""))
+        row = dict(base)
+        try:
+            creation = dt.date.fromisoformat(row.get("date_creation", ""))
+            if not cutoff < creation <= today:
+                continue
+        except ValueError:
+            pass
+        if row.get("ca") not in (None, ""):
+            try:
+                if float(row["ca"]) > args.ca_max:
+                    continue
+            except ValueError:
+                row["statut"] = "CA_INVALIDE_A_VERIFIER"
+        naf = row.get("code_naf", "")
+        secondary = naf.startswith(SECONDARY_CODES)
+        tech = naf.startswith(TECH_CODES)
+        operation = operation_nature(" ".join(e.get("preuve", "") for e in increases))
+        amounts = explicit_amounts(base.get("preuve", ""))
+        press_items = list(candidate["press"].values())
+        verified = row.get("statut") in ("A_QUALIFIER", "PRESSE_IDENTITE_VERIFIEE_LEVEE_A_CONFIRMER")
+        accounting = any(t in operation for t in ("INCORPORATION_RESERVES", "APPORT_NATURE", "CONVERSION", "FUSION"))
+        nominal_large = amounts.get("variation_nominale", 0) >= args.nominal_min
+        if not verified:
+            lot, reason = "REVUE", "Identité, âge ou données à vérifier"
+        elif not increases:
+            lot, reason = "AUTRES", "Pas d'augmentation explicitement mentionnée"
+        elif secondary or accounting:
+            lot, reason = "SECONDAIRE", "Structure patrimoniale/financière possible ou nature opération à examiner"
+        elif press_items:
+            lot, reason = "MEDIATISE", "Candidat BODACC avec correspondance presse exacte"
+        elif tech or nominal_large or "NUMERAIRE" in operation:
+            lot, reason = "PRIORITAIRE", "Augmentation explicite + " + ("profil métier ciblé" if tech else "variation nominale importante" if nominal_large else "numéraire mentionné")
+        else:
+            lot, reason = "REVUE", "Augmentation explicite ; activité et financement à préciser"
+        first_press = min((p.get("date_publication", "") for p in press_items), default="")
+        delay = ""
+        if first_press and increases:
+            delay = (dt.date.fromisoformat(first_press) - min(dt.date.fromisoformat(e["date_publication"]) for e in increases)).days
+        row.update(amounts)
+        row.update(lot=lot, motif=reason, profil="CODE_METIER_CIBLE_A_CONFIRMER" if tech else "STRUCTURE_A_EXAMINER" if secondary else "ACTIVITE_A_VERIFIER",
+                   ca_statut="PUBLIE" if row.get("ca") not in (None, "") else "INCONNU",
+                   premiere_detection=candidate["first_seen"], derniere_detection=candidate["last_seen"],
+                   nb_augmentations=len(increases), gouvernance_mentionnee="OUI" if any("administration" in normalize(e.get("preuve", "")) for e in increases) else "NON_MENTIONNEE",
+                   nature_operation=operation, montant_statut=amounts.get("montant_statut", "MONTANT_INCONNU"),
+                   statut_presse="CORRESPONDANCE_TROUVEE" if press_items else "NON_VERIFIEE_CE_RUN" if args.no_rss else "COUVERTURE_INCOMPLETE" if warnings else "AUCUNE_CORRESPONDANCE_DANS_FLUX_CONSULTES",
+                   presse_urls=" ; ".join(p.get("source_url", "") for p in press_items), date_premiere_presse=first_press,
+                   delai_presse_jours=delay, sources_bodacc=" ; ".join(dict.fromkeys(e.get("source_url", "") for e in events)),
+                   verification_activite="A_FAIRE_SUR_SITE_OFFICIEL", nouveau="OUI" if candidate["first_seen"] == stamp else "NON")
+        rows.append(row)
+    order = {"PRIORITAIRE": 0, "REVUE": 1, "MEDIATISE": 2, "SECONDAIRE": 3, "AUTRES": 4}
+    rows.sort(key=lambda r: (order[r["lot"]], r.get("company", "")))
+    write_rows(out / f"veille_{stamp}.csv", rows)
+    for lot in order:
+        write_rows(out / f"startup_{lot.lower()}_{stamp}.csv", [r for r in rows if r["lot"] == lot])
+    lines = [f"# Détection BODACC startups - {stamp}", "", f"{len(rows)} entreprises dans la mémoire exportée", "",
+             "Le lot prioritaire est une présélection à vérifier, pas une levée confirmée ni une preuve d'absence de presse.",
+             "Montants : variation nominale uniquement si avant/après explicites dans la même annonce ; prime et fonds levés non déduits.",
+             "Les actes INPI, sites officiels, recrutements et investisseurs ne sont pas consultés automatiquement dans cette version.",
+             "Le délai presse se mesure depuis la publication BODACC, pas depuis la première détection. Les RSS ne couvrent pas toutes les archives.", ""]
+    for lot in order:
+        subset = [r for r in rows if r["lot"] == lot]
+        lines.append(f"## {lot} : {len(subset)}")
+        for r in subset:
+            lines.append(f"- {r.get('company')} ({r['siren']}) : {r['motif']} | {r['source_url']}")
     if warnings:
-        lines += ['', '## Couverture partielle / erreurs', ''] + ['- ' + w for w in warnings]
-    (out / f'veille_{stamp}.md').write_text('\n'.join(lines), encoding='utf-8')
-    atomic_json(out / 'entreprises_cache.json', cache)
-    # Les cas non résolus restent nouveaux pour être retentés au prochain passage.
-    for row in rows:
-        if row['statut'] not in ('IDENTITE_NON_RESOLUE', 'ERREUR_RESOLUTION_A_RETENTER', 'DATE_CREATION_INCONNUE'):
-            seen[row['event_id']] = stamp
-    atomic_json(out / 'evenements_vus.json', seen)
-    print(f'{len(rows)} événements exportés : {csv_path}')
-    for warning in warnings:
-        print('ATTENTION : ' + warning)
+        lines += ["", "## Couverture incomplète"] + ["- " + w for w in warnings]
+    (out / f"veille_{stamp}.md").write_text("\n".join(lines), encoding="utf-8")
+    atomic_json(out / "startup_state.json", state)
+    atomic_json(out / "entreprises_cache.json", cache)
+    print(f"{len(rows)} entreprises exportées : {out}")
+    for lot in order:
+        print(f"{lot} : {sum(r['lot']==lot for r in rows)}")
+    for w in warnings:
+        print("ATTENTION : " + w)
     return 2 if fatal or warnings else 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())
