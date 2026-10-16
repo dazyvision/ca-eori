@@ -1,0 +1,31 @@
+name: Tester la veille startups
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  veille:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Analyser les 7 derniers jours
+        run: python -u veille_capital_gratuite.py --days 7
+
+      - name: Publier les résultats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultats-startups
+          path: |
+            sorties/veille_gratuite/veille_*.csv
+            sorties/veille_gratuite/veille_*.md
+          if-no-files-found: warn
